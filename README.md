@@ -1,3 +1,3 @@
 # hello-world
 Practicing Github flow
-I'm Matt
+I'm Matt Peters
