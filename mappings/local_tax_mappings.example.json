@@ -1,0 +1,7 @@
+{
+  "jurisdiction_to_workday_code": {
+    "PA_PHILADELPHIA_CITY_WAGE_TAX": "PHL_WAGE",
+    "OH_COLUMBUS_CITY_TAX": "COLUMBUS_CITY"
+  },
+  "fallback_rate_tolerance": 0.0005
+}
