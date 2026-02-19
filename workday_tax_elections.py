@@ -14,6 +14,8 @@ No credentials are hardcoded.
 
 from __future__ import annotations
 
+import argparse
+import csv
 import json
 import logging
 import os
@@ -86,6 +88,36 @@ def fetch_workday_report_rows(
     if not isinstance(rows, list):
         return []
     return rows
+
+
+def fetch_csv_work_rows(csv_path: str) -> List[Dict[str, Any]]:
+    """Read worker rows from CSV, mapping Work_* address fields to expected keys."""
+    worker_rows: List[Dict[str, Any]] = []
+    with open(csv_path, "r", encoding="utf-8-sig", newline="") as file:
+        reader = csv.DictReader(file)
+        for row in reader:
+            work_street_1 = str(
+                row.get("Work_Street_Address") or row.get("Street_Address") or ""
+            ).strip()
+            work_street_2 = str(
+                row.get("Work_Street_Address_2") or row.get("Street_Address_2") or ""
+            ).strip()
+            if work_street_2:
+                work_street_1 = f"{work_street_1} {work_street_2}".strip()
+
+            worker_rows.append(
+                {
+                    "Worker_ID": str(
+                        row.get("Worker_ID") or row.get("Employee_ID") or ""
+                    ).strip(),
+                    "Street_Address": work_street_1,
+                    "City": str(row.get("Work_City") or row.get("City") or "").strip(),
+                    "State": str(row.get("Work_State") or row.get("State") or "").strip(),
+                    "Zip": str(row.get("Work_Zip") or row.get("Zip") or "").strip(),
+                    "Filing_Status": str(row.get("Filing_Status") or "").strip(),
+                }
+            )
+    return worker_rows
 
 
 def log_geocode_failure(
@@ -196,46 +228,97 @@ def update_workday_tax_election(
     soap_client.service.Maintain_Employee_Tax_Elections(**request_payload)
 
 
+def parse_args() -> argparse.Namespace:
+    """Parse CLI options for choosing worker source and SOAP behavior."""
+    parser = argparse.ArgumentParser(
+        description="Update Workday tax elections using Workday report or CSV input."
+    )
+    parser.add_argument(
+        "--csv-path",
+        help=(
+            "Optional path to a CSV file. If provided, rows are read from CSV "
+            "instead of WORKDAY_REPORT_URL. Work_* address columns are preferred."
+        ),
+    )
+    parser.add_argument(
+        "--skip-soap",
+        action="store_true",
+        help="Run Symmetry geocoding only and skip Workday SOAP updates.",
+    )
+    return parser.parse_args()
+
+
 def run() -> None:
     """Run the complete workflow and output summary artifacts."""
     # Load .env first so all API credentials/URLs come from environment variables.
     load_dotenv()
+    args = parse_args()
     logger = configure_logging()
 
-    # Read required config values once at startup for fail-fast validation.
-    workday_report_url = get_required_env("WORKDAY_REPORT_URL")
-    workday_username = get_required_env("WORKDAY_USERNAME")
-    workday_password = get_required_env("WORKDAY_PASSWORD")
-    workday_soap_wsdl = get_required_env("WORKDAY_SOAP_WSDL")
+    # Read shared Symmetry config needed for every worker.
     symmetry_api_key = get_required_env("SYMMETRY_API_KEY")
     symmetry_calculate_url = get_required_env("SYMMETRY_CALCULATE_URL")
-    tax_effective_date = os.getenv("TAX_EFFECTIVE_DATE", "2025-01-01")
 
     # Keep one HTTP session for efficient TCP reuse across requests.
     session = requests.Session()
 
-    # Step 1: pull all worker rows from the Workday custom report.
-    worker_rows = fetch_workday_report_rows(
-        report_url=workday_report_url,
-        username=workday_username,
-        password=workday_password,
-        session=session,
-    )
+    # Step 1: choose worker source (CSV vs Workday report endpoint).
+    if args.csv_path:
+        worker_rows = fetch_csv_work_rows(args.csv_path)
+        logger.info("Loaded %s worker rows from CSV: %s", len(worker_rows), args.csv_path)
+    else:
+        workday_report_url = get_required_env("WORKDAY_REPORT_URL")
+        workday_username = get_required_env("WORKDAY_USERNAME")
+        workday_password = get_required_env("WORKDAY_PASSWORD")
+        worker_rows = fetch_workday_report_rows(
+            report_url=workday_report_url,
+            username=workday_username,
+            password=workday_password,
+            session=session,
+        )
+        logger.info(
+            "Loaded %s worker rows from Workday custom report", len(worker_rows)
+        )
 
-    # Create one reusable SOAP client (required) for all Workday updates.
-    soap_client = build_soap_client(
-        wsdl_url=workday_soap_wsdl,
-        username=workday_username,
-        password=workday_password,
-    )
+    # Create one reusable SOAP client unless the run is explicitly geocode-only.
+    soap_client: Optional[Client] = None
+    tax_effective_date = os.getenv("TAX_EFFECTIVE_DATE", "2025-01-01")
+    if not args.skip_soap:
+        workday_soap_wsdl = get_required_env("WORKDAY_SOAP_WSDL")
+        workday_username = get_required_env("WORKDAY_USERNAME")
+        workday_password = get_required_env("WORKDAY_PASSWORD")
+        soap_client = build_soap_client(
+            wsdl_url=workday_soap_wsdl,
+            username=workday_username,
+            password=workday_password,
+        )
 
     geocode_failures: List[Dict[str, str]] = []
     soap_failures: List[str] = []
     succeeded = 0
+    geocode_successes: List[Dict[str, str]] = []
 
     for worker_row in worker_rows:
         worker_id = str(worker_row.get("Worker_ID", "")).strip()
         address = build_address(worker_row)
+
+        # Guard against empty Work_* address data before external API calls.
+        if not all(
+            [
+                str(worker_row.get("Street_Address", "")).strip(),
+                str(worker_row.get("City", "")).strip(),
+                str(worker_row.get("State", "")).strip(),
+                str(worker_row.get("Zip", "")).strip(),
+            ]
+        ):
+            log_geocode_failure(
+                logger,
+                worker_id,
+                address,
+                "Missing one or more required address fields",
+            )
+            geocode_failures.append({"worker_id": worker_id, "address": address})
+            continue
 
         # Step 2: lookup local tax details from Symmetry; skip on any lookup issue.
         local_tax_data = call_symmetry_for_local_tax(
@@ -250,9 +333,23 @@ def run() -> None:
             continue
 
         local_tax_code, jurisdiction_name = local_tax_data
+        geocode_successes.append(
+            {
+                "worker_id": worker_id,
+                "address": address,
+                "local_tax_code": local_tax_code,
+                "jurisdiction_name": jurisdiction_name,
+            }
+        )
+
+        if args.skip_soap:
+            succeeded += 1
+            continue
 
         # Step 3: submit tax election update to Workday; keep processing on failure.
         try:
+            if soap_client is None:
+                raise RuntimeError("SOAP client was not initialized")
             update_workday_tax_election(
                 soap_client=soap_client,
                 worker_row=worker_row,
@@ -275,6 +372,10 @@ def run() -> None:
             file,
             indent=2,
         )
+
+    # Persist successful Symmetry geocodes so CSV-only runs have a concrete output.
+    with open("symmetry_results.json", "w", encoding="utf-8") as file:
+        json.dump(geocode_successes, file, indent=2)
 
     # Print required completion summary to console (and log file).
     logger.info("==================================================")
